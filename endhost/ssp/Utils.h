@@ -32,4 +32,11 @@ void destroyStats(SCIONStats *stats);
 
 int timedWait(pthread_cond_t *cond, pthread_mutex_t *mutex, double timeout);
 
+struct CompareOffset {
+    bool operator()(const SSPPacket *sp1, const SSPPacket *sp2) const
+    {
+        return sp1->getOffset() > sp2->getOffset();
+    }
+};
+
 #endif

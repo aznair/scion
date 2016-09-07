@@ -129,7 +129,7 @@ struct SSPPacket {
     uint16_t getPort() { return ntohs(header.port); }
     void setPort(uint16_t port) { header.port = htons(port); }
 
-    uint64_t getOffset() { return be64toh(header.offset) & 0xffffffffffffff; }
+    uint64_t getOffset() const { return be64toh(header.offset) & 0xffffffffffffff; }
     void setOffset(uint64_t offset) { header.offset = htobe64(offset & 0xffffffffffffff); }
 
     uint8_t getMark() { return be64toh(header.offset) >> 56; }

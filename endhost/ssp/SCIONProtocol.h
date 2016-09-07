@@ -2,6 +2,9 @@
 #define SCION_PROTOCOL_H
 
 #include <map>
+#include <queue>
+#include <set>
+
 #include <pthread.h>
 
 #include "ConnectionManager.h"
@@ -9,6 +12,7 @@
 #include "OrderedList.h"
 #include "ProtocolConfigs.h"
 #include "SCIONDefines.h"
+#include "Utils.h"
 
 class SCIONProtocol {
 public:
@@ -147,7 +151,8 @@ protected:
     uint32_t                mTotalReceived;
     uint64_t                mNextPacket;
     OrderedList<SSPPacket *> *mReadyPackets;
-    OrderedList<SSPPacket *> *mOOPackets;
+    std::priority_queue<SSPPacket *, std::vector<SSPPacket *>, CompareOffset> mOOPackets;
+    std::set<uint64_t> mOOSet;
 
     // select
     pthread_mutex_t        mSelectMutex;

@@ -219,7 +219,6 @@ SSPProtocol::SSPProtocol(int sock, const char *sciond)
     mProtocolID = L4_SSP;
     mProbeInterval = SSP_PROBE_INTERVAL;
     mReadyPackets = new OrderedList<SSPPacket *>(NULL, destroySSPPacket);
-    mOOPackets = new OrderedList<SSPPacket *>(compareOffset, destroySSPPacket);
 
     getWindowSize();
 
@@ -241,8 +240,11 @@ SSPProtocol::~SSPProtocol()
     }
     mReadyPackets->clean();
     delete mReadyPackets;
-    mOOPackets->clean();
-    delete mOOPackets;
+    while (!mOOPackets.empty()) {
+        SSPPacket *sp = mOOPackets.top();
+        mOOPackets.pop();
+        destroySSPPacket(sp);
+    }
     pthread_mutex_destroy(&mSelectMutex);
 }
 
@@ -533,14 +535,14 @@ SSPPacket * SSPProtocol::checkOutOfOrderQueue(SSPPacket *sp)
     uint64_t end = start + sp->len;
     bool pushed = false;
     SSPPacket *last = sp;
-    if (mOOPackets->empty()) {
+    if (mOOPackets.empty()) {
         mReadyPackets->push(sp);
         mLowestPending = end;
         pushed = true;
     } else {
-        while (!mOOPackets->empty()) {
+        while (!mOOPackets.empty()) {
             DEBUG("check out-of-order queue\n");
-            last = (SSPPacket *)mOOPackets->front();
+            last = (SSPPacket *)mOOPackets.top();
             if (last->getOffset() < end)
                 break;
             if (!pushed) {
@@ -552,7 +554,7 @@ SSPPacket * SSPProtocol::checkOutOfOrderQueue(SSPPacket *sp)
             end = start + last->len;
             DEBUG("packet: %lu ~ %lu\n", start, end);
             if (start <= mLowestPending && end > mLowestPending) {
-                mOOPackets->pop();
+                mOOPackets.pop();
                 mReadyPackets->push(last);
                 mLowestPending = end;
             } else {
@@ -658,14 +660,16 @@ void SSPProtocol::handleOutOfOrder(SSPPacket *sp, int pathIndex)
     if (end - 1 > mHighestReceived)
         mHighestReceived = end - 1;
 
-    bool found = mOOPackets->push(sp);
+    bool found = mOOSet.find(sp->getOffset()) != mOOSet.end();
     if (found) {
         DEBUG("duplicate packet: discard\n");
         pthread_mutex_unlock(&mReadMutex);
         sendAck(sp, pathIndex);
         destroySSPPacket(sp);
     } else {
-        DEBUG("added to out-of-order queue\n");
+        mOOPackets.push(sp);
+        mOOSet.insert(sp->getOffset());
+        DEBUG("added to out-of-order queue: top is %lu\n", mOOPackets.top()->getOffset());
         mTotalReceived += packetSize;
         DEBUG("receive window now %u/%u\n", mTotalReceived, mLocalReceiveWindow);
         pthread_mutex_unlock(&mReadMutex);

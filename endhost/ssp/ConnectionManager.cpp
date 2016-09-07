@@ -739,9 +739,9 @@ void SSPConnectionManager::handlePacketAcked(bool match, SCIONPacket *ack, SCION
         handleAckOnPath(ack, sampleRtt, sent->pathIndex);
     } else if (pn != 0) {
         DEBUG("no longer care about packet %lu (path %d): min is %lu\n",
-                pn, sent->pathIndex, acksp->ack.L);
+                pn, sent->pathIndex, acksp->getL());
         sent->arrivalTime = ack->arrivalTime;
-        sp->ack.L = pn;
+        sp->setL(pn);
         handleAckOnPath(sent, false, sent->pathIndex);
     }
     if (pn == 0) {
