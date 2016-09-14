@@ -580,7 +580,7 @@ void RenoPathState::handleTimeout()
 void RenoPathState::handleDupAck()
 {
     mDupAckCount++;
-    if (mState > SSP_FR_THRESHOLD && mState == TCP_STATE_FAST_RETRANSMIT) {
+    if (mDupAckCount > SSP_FR_THRESHOLD && mState == TCP_STATE_FAST_RETRANSMIT) {
         mCongestionWindow++;
         mWindow = mCongestionWindow > mSendWindow ? mSendWindow : mCongestionWindow;
         DEBUG("path %d: duplicate ack received: window set to %d (%d/%d)\n", mPathIndex, mWindow, mCongestionWindow, mSendWindow);
