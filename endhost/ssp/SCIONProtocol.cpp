@@ -1,7 +1,14 @@
-#include <unistd.h>
 #include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <inttypes.h>
+#include <limits.h>
+#include <math.h>
+#include <net/if.h>
+#include <sys/un.h>
+#include <unistd.h>
 
 #include "Extensions.h"
+#include "Path.h"
 #include "ProtocolConfigs.h"
 #include "SCIONProtocol.h"
 #include "Utils.h"
@@ -26,25 +33,45 @@ void * timerThread(void *arg)
 }
 
 SCIONProtocol::SCIONProtocol(int sock, const char *sciond)
-    : mPathManager(NULL),
-    mSrcPort(0),
+    : mSrcPort(0),
     mDstPort(0),
     mIsReceiver(false),
     mReadyToRead(false),
     mBlocking(true),
     mState(SCION_RUNNING),
     mNextSendByte(0),
-    mProbeNum(0)
+    mProbeNum(0),
+    mInvalid(0)
 {
     mSocket = sock; // gets closed by SCIONSocket
+    mDaemonSocket = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strcpy(addr.sun_path, sciond);
+    if (connect(mDaemonSocket, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        fprintf(stderr, "failed to connect to sciond at %s: %s\n", sciond, strerror(errno));
+        exit(1);
+    }
+
+    memset(&mLocalAddr, 0, sizeof(mLocalAddr));
+    // get IP from OS to use as default for mLocalAddr
+    // can specify different IP with bind() later
+    getDefaultIP();
     memset(&mDstAddr, 0, sizeof(mDstAddr));
+
     gettimeofday(&mLastProbeTime, NULL);
+
+    pthread_mutex_init(&mDispatcherMutex, NULL);
+    pthread_mutex_init(&mPathMutex, NULL);
+    pthread_mutex_init(&mStateMutex, NULL);
     pthread_mutex_init(&mReadMutex, NULL);
+
     pthread_condattr_t ca;
     pthread_condattr_init(&ca);
     pthread_condattr_setclock(&ca, CLOCK_REALTIME);
     pthread_cond_init(&mReadCond, &ca);
-    pthread_mutex_init(&mStateMutex, NULL);
+    pthread_cond_init(&mPathCond, &ca);
 }
 
 SCIONProtocol::~SCIONProtocol()
@@ -53,12 +80,303 @@ SCIONProtocol::~SCIONProtocol()
     pthread_mutex_destroy(&mReadMutex);
     pthread_cond_destroy(&mReadCond);
     pthread_mutex_destroy(&mStateMutex);
+    pthread_mutex_destroy(&mPathMutex);
+    pthread_cond_destroy(&mPathCond);
+    close(mDaemonSocket);
+}
+
+void SCIONProtocol::getDefaultIP()
+{
+    struct ifaddrs *ifaddr, *ifa;
+
+    if (getifaddrs(&ifaddr) < 0) {
+        fprintf(stderr, "failed to get OS IP addr: %s\n", strerror(errno));
+        exit(1);
+    }
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == NULL)
+            continue;
+        if (ifa->ifa_flags & IFF_LOOPBACK)
+            continue;
+        // TODO(aznair): IPv6
+        if (ifa->ifa_addr->sa_family == AF_INET) {
+            struct sockaddr_in *sa = (struct sockaddr_in *)(ifa->ifa_addr);
+            mLocalAddr.host.addr_type = ADDR_IPV4_TYPE;
+            memcpy(mLocalAddr.host.addr, &sa->sin_addr, ADDR_IPV4_LEN);
+            break;
+        } else if (ifa->ifa_addr->sa_family == AF_INET6) {
+            struct sockaddr_in6 *sa6 = (struct sockaddr_in6 *)(ifa->ifa_addr);
+            mLocalAddr.host.addr_type = ADDR_IPV6_TYPE;
+            memcpy(mLocalAddr.host.addr, &sa6->sin6_addr, ADDR_IPV6_LEN);
+            break;
+        }
+    }
+    freeifaddrs(ifaddr);
+}
+
+int SCIONProtocol::maxPayloadSize(double timeout)
+{
+    int min = INT_MAX;
+    pthread_mutex_lock(&mPathMutex);
+    while (mPaths.size() - mInvalid == 0) {
+        if (timeout > 0.0) {
+            if (timedWait(&mPathCond, &mPathMutex, timeout) == ETIMEDOUT) {
+                pthread_mutex_unlock(&mPathMutex);
+                DEBUG("%p: timeout getting max payload size (no paths)\n", this);
+                return -ETIMEDOUT;
+            }
+        } else {
+            pthread_cond_wait(&mPathCond, &mPathMutex);
+        }
+    }
+    for (size_t i = 0; i < mPaths.size(); i++) {
+        if (!mPaths[i])
+            continue;
+        int size = mPaths[i]->getPayloadLen(false);
+        if (size < min)
+            min = size;
+    }
+    pthread_mutex_unlock(&mPathMutex);
+    return min;
+}
+
+void SCIONProtocol::queryLocalAddress()
+{
+    DEBUG("%s\n", __func__);
+    uint8_t buf[32];
+
+    buf[0] = 1;
+    send_dp_header(mDaemonSocket, NULL, 1);
+    send_all(mDaemonSocket, buf, 1);
+    recv_all(mDaemonSocket, buf, DP_HEADER_LEN);
+    int len = 0;
+    parse_dp_header(buf, NULL, &len);
+    if (len == -1) {
+        fprintf(stderr, "out of sync with sciond\n");
+        exit(1);
+    }
+    recv_all(mDaemonSocket, buf, len);
+    mLocalAddr.isd_as = ntohl(*(uint32_t *)buf);
+}
+
+int SCIONProtocol::setRemoteAddress(SCIONAddr addr, double timeout)
+{
+    DEBUG("%p: setRemoteAddress: (%d-%d)\n", this, ISD(addr.isd_as), AS(addr.isd_as));
+    if (addr.isd_as == mDstAddr.isd_as) {
+        DEBUG("%p: dst addr already set: (%d-%d)\n", this, ISD(mDstAddr.isd_as), AS(mDstAddr.isd_as));
+        return -EPERM;
+    }
+
+    mDstAddr = addr;
+
+    double waitTime = timeout;
+    struct timeval start, end;
+
+    pthread_mutex_lock(&mPathMutex);
+    for (size_t i = 0; i < mPaths.size(); i++) {
+        Path *p = mPaths[i];
+        if (p)
+            delete p;
+    }
+    mPaths.clear();
+    mInvalid = 0;
+
+    while (mPaths.size() - mInvalid == 0) {
+        DEBUG("%p: trying to connect but no paths available\n", this);
+        gettimeofday(&start, NULL);
+        getPaths(waitTime);
+        gettimeofday(&end, NULL);
+        long delta = elapsedTime(&start, &end);
+        waitTime -= delta / 1000000.0;
+        if (timeout > 0.0 && waitTime < 0) {
+            pthread_mutex_unlock(&mPathMutex);
+            return -ETIMEDOUT;
+        }
+    }
+    pthread_mutex_unlock(&mPathMutex);
+    return 0;
+}
+
+void SCIONProtocol::getPaths(double timeout)
+{
+    int buflen = (MAX_PATH_LEN + 15) * MAX_TOTAL_PATHS;
+    int recvlen;
+    uint8_t buf[buflen];
+
+    memset(buf, 0, buflen);
+
+    // Get local address first
+    if (mLocalAddr.isd_as == 0) {
+        queryLocalAddress();
+    }
+
+    prunePaths();
+    int numPaths = mPaths.size() - mInvalid;
+
+    if (timeout > 0.0) {
+        struct timeval t;
+        t.tv_sec = (size_t)floor(timeout);
+        t.tv_usec = (size_t)((timeout - floor(timeout)) * 1000000);
+        setsockopt(mDaemonSocket, SOL_SOCKET, SO_RCVTIMEO, &t, sizeof(t));
+    }
+
+    // Now get paths for remote address(es)
+    std::vector<Path *> candidates;
+    memset(buf, 0, buflen);
+    *(uint32_t *)(buf + 1) = htonl(mDstAddr.isd_as);
+    send_dp_header(mDaemonSocket, NULL, 5);
+    send_all(mDaemonSocket, buf, 5);
+
+    memset(buf, 0, buflen);
+    recvlen = recv_all(mDaemonSocket, buf, DP_HEADER_LEN);
+    if (recvlen < 0) {
+        DEBUG("error while receiving header from sciond: %s\n", strerror(errno));
+        return;
+    }
+    parse_dp_header(buf, NULL, &recvlen);
+    if (recvlen == -1) {
+        fprintf(stderr, "out of sync with sciond\n");
+        exit(1);
+    }
+    int reallen = recvlen > buflen ? buflen : recvlen;
+    reallen = recv_all(mDaemonSocket, buf, reallen);
+    if (reallen > 0) {
+        DEBUG("%d byte response from daemon\n", reallen);
+        int offset = 0;
+        while (offset < reallen &&
+                numPaths + candidates.size() < MAX_TOTAL_PATHS) {
+            uint8_t *ptr = buf + offset;
+            int pathLen = checkPath(ptr, reallen - offset, candidates);
+            if (pathLen < 0)
+                break;
+            offset += pathLen;
+        }
+    }
+    insertPaths(candidates);
+    DEBUG("total %lu paths\n", mPaths.size() - mInvalid);
+
+    // If sciond sent excess data, consume it to sync state
+    if (reallen < recvlen) {
+        int remaining = recvlen - reallen;
+        while (remaining > 0) {
+            int read = recv(mDaemonSocket, buf, buflen, 0);
+            if (read < 0)
+                break;
+            remaining -= read;
+        }
+    }
+
+    pthread_cond_broadcast(&mPathCond);
+}
+
+void SCIONProtocol::prunePaths()
+{
+    for (size_t i = 0; i < mPaths.size(); i++) {
+        Path *p = mPaths[i];
+        if (p && (!p->isValid() || !mPolicy.validate(p))) {
+            DEBUG("path %lu not valid\n", i);
+            mPaths[i] = NULL;
+            delete p;
+            mInvalid++;
+        }
+    }
+}
+
+void SCIONProtocol::insertPaths(std::vector<Path *> &candidates)
+{
+    if (candidates.empty())
+        return;
+
+    for (size_t i = 0; i < mPaths.size(); i++) {
+        if (mPaths[i])
+            continue;
+        Path *p = candidates.front();
+        candidates.erase(candidates.begin());
+        mPaths[i] = p;
+        p->setIndex(i);
+        mInvalid--;
+        if (candidates.empty())
+            break;
+    }
+    for (size_t i = 0; i < candidates.size(); i++) {
+        Path *p = candidates[i];
+        int index = mPaths.size();
+        mPaths.push_back(p);
+        p->setIndex(index);
+    }
+}
+
+int SCIONProtocol::checkPath(uint8_t *ptr, int len, std::vector<Path *> &candidates)
+{
+    bool add = true;
+    int pathLen = *ptr * 8;
+    if (pathLen + 1 > len)
+        return -1;
+    uint8_t addr_type = *(ptr + 1 + pathLen);
+    int addr_len = get_addr_len(addr_type);
+    // TODO: IPv6 (once sciond supports it)
+    int interfaceOffset = 1 + pathLen + 1 + addr_len + 2 + 2;
+    int interfaceCount = *(ptr + interfaceOffset);
+    if (interfaceOffset + 1 + interfaceCount * IF_TOTAL_LEN > len)
+        return -1;
+    for (size_t j = 0; j < mPaths.size(); j++) {
+        if (mPaths[j] &&
+                mPaths[j]->isSamePath(ptr + 1, pathLen)) {
+            add = false;
+            break;
+        }
+    }
+    for (size_t j = 0; j < candidates.size(); j++) {
+        if (candidates[j]->usesSameInterfaces(ptr + interfaceOffset + 1, interfaceCount)) {
+            add = false;
+            break;
+        }
+    }
+    if (add) {
+        Path *p = createPath(mDstAddr, ptr, 0);
+        if (mPolicy.validate(p))
+            candidates.push_back(p);
+        else
+            delete p;
+    }
+    return interfaceOffset + 1 + interfaceCount * IF_TOTAL_LEN;
+}
+
+int SCIONProtocol::insertOnePath(Path *p)
+{
+    for (size_t i = 0; i < mPaths.size(); i++) {
+        if (mPaths[i])
+            continue;
+        mPaths[i] = p;
+        p->setIndex(i);
+        mInvalid--;
+        return i;
+    }
+    int index = mPaths.size();
+    mPaths.push_back(p);
+    p->setIndex(index);
+    return index;
+}
+
+Path * SCIONProtocol::createPath(SCIONAddr &dstAddr, uint8_t *rawPath, int pathLen)
+{
+    return NULL;
 }
 
 int SCIONProtocol::bind(SCIONAddr addr, int sock)
 {
+    DEBUG("%p: bind to (%d-%d):%s\n",
+            this, ISD(addr.isd_as), AS(addr.isd_as),
+            addr_to_str(addr.host.addr, addr.host.addr_type, NULL));
+
     mSrcPort = addr.host.port;
-    return mPathManager->setLocalAddress(addr);
+    if (mLocalAddr.isd_as == 0)
+        queryLocalAddress();
+    if (addr.isd_as == 0) /* bind to any address */
+        return 0;
+    mLocalAddr.host.addr_type = addr.host.addr_type;
+    memcpy(mLocalAddr.host.addr, addr.host.addr, get_addr_len(addr.host.addr_type));
+    return 0;
 }
 
 int SCIONProtocol::connect(SCIONAddr addr, double timeout)
@@ -92,7 +410,18 @@ void SCIONProtocol::handleTimerEvent()
 
 void SCIONProtocol::handlePathError(SCIONPacket *packet)
 {
-    mPathManager->handlePathError(packet);
+    pthread_mutex_lock(&mPathMutex);
+    for (size_t i = 0; i < mPaths.size(); i++) {
+        if (mPaths[i] && mPaths[i]->isSamePath(packet->header.path, packet->header.pathLen)) {
+            DEBUG("path %lu is invalid\n", i);
+            delete mPaths[i];
+            mPaths[i] = NULL;
+            mInvalid++;
+            break;
+        }
+    }
+    getPaths();
+    pthread_mutex_unlock(&mPathMutex);
 }
 
 bool SCIONProtocol::isReceiver()
@@ -159,12 +488,46 @@ int SCIONProtocol::registerDispatcher(uint64_t flowID, uint16_t port, int sock)
 
 int SCIONProtocol::setISDWhitelist(void *data, size_t len)
 {
-    if (!mPathManager)
-        return -EPERM;
     // Disallow changing policy if connection is already active
     if (mNextSendByte != 1)
         return -EPERM;
-    return mPathManager->setISDWhitelist(data, len);
+    if (len % 2 != 0) {
+        DEBUG("List of ISDs should have an even total length\n");
+        return -EINVAL;
+    }
+
+    if (mLocalAddr.isd_as == 0) {
+        queryLocalAddress();
+    }
+
+    std::vector<uint16_t> isds;
+    bool foundSelf = false;
+    bool foundDst = false;
+    for (size_t i = 0; i < len / 2; i ++) {
+        uint16_t isd = *((uint16_t *)data + i);
+        if (isd == ISD(mLocalAddr.isd_as))
+            foundSelf = true;
+        if (isd == ISD(mDstAddr.isd_as))
+            foundDst = true;
+        isds.push_back(isd);
+    }
+
+    if (len > 0) {
+        if (!foundSelf) {
+            DEBUG("Own ISD not whitelisted\n");
+            return -EINVAL;
+        }
+        if (!foundDst) {
+            DEBUG("Destination ISD not whitelisted\n");
+            return -EINVAL;
+        }
+    }
+
+    mPolicy.setISDWhitelist(isds);
+    pthread_mutex_lock(&mPathMutex);
+    getPaths();
+    pthread_mutex_unlock(&mPathMutex);
+    return 0;
 }
 
 int SCIONProtocol::shutdown(bool force)
@@ -174,20 +537,16 @@ int SCIONProtocol::shutdown(bool force)
 
 uint32_t SCIONProtocol::getLocalIA()
 {
-    if (!mPathManager)
-        return 0;
-    SCIONAddr *addr = mPathManager->localAddress();
-    if (addr->isd_as == 0)
-        mPathManager->queryLocalAddress();
-    return addr->isd_as;
+    if (mLocalAddr.isd_as == 0)
+        queryLocalAddress();
+    return mLocalAddr.isd_as;
 }
 
 void SCIONProtocol::threadCleanup()
 {
-    if (mPathManager)
-        mPathManager->threadCleanup();
     pthread_mutex_unlock(&mReadMutex);
     pthread_mutex_unlock(&mStateMutex);
+    pthread_mutex_unlock(&mPathMutex);
 }
 
 int SCIONProtocol::getPort()
@@ -195,11 +554,17 @@ int SCIONProtocol::getPort()
     return mSrcPort;
 }
 
-int SCIONProtocol::maxPayloadSize(double timeout)
+int SCIONProtocol::sendRawPacket(uint8_t *buf, int len, HostAddr *firstHop)
 {
-    if (!mPathManager)
-        return -1;
-    return mPathManager->maxPayloadSize(timeout);
+    pthread_mutex_lock(&mDispatcherMutex);
+    send_dp_header(mSendSocket, firstHop, len);
+    int sent = send_all(mSendSocket, buf, len);
+    pthread_mutex_unlock(&mDispatcherMutex);
+    return sent;
+}
+
+void SCIONProtocol::didSend(SCIONPacket *packet)
+{
 }
 
 // SSP
@@ -214,7 +579,14 @@ SSPProtocol::SSPProtocol(int sock, const char *sciond)
     mAckVectorOffset(0),
     mTotalReceived(0),
     mNextPacket(0),
-    mSelectCount(0)
+    mSelectCount(0),
+    mRunning(true),
+    mFinAcked(false),
+    mFinAttempts(0),
+    mInitAcked(false),
+    mResendInit(true),
+    mHighestAcked(0),
+    mTotalSize(0)
 {
     mProtocolID = L4_SSP;
     mProbeInterval = SSP_PROBE_INTERVAL;

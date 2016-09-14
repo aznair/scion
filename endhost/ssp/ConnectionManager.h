@@ -12,52 +12,6 @@ class SSPProtocol;
 class Path;
 class PathState;
 
-class PathManager {
-public:
-    PathManager(int sock, const char *sciond);
-    virtual ~PathManager();
-
-    void getDefaultIP();
-    int getSocket();
-    int getPathCount();
-    int maxPayloadSize(double timeout=0.0);
-    SCIONAddr * localAddress();
-
-    void queryLocalAddress();
-    int setLocalAddress(SCIONAddr addr);
-    virtual int setRemoteAddress(SCIONAddr addr, double timeout=0.0);
-    void getPaths(double timeout=0.0);
-
-    virtual Path * createPath(SCIONAddr &dstAddr, uint8_t *rawPath, int pathLen);
-    virtual void handleTimeout();
-    virtual void handlePathError(SCIONPacket *packet);
-    virtual void getStats(SCIONStats *stats);
-
-    int setISDWhitelist(void *data, size_t len);
-
-    virtual void threadCleanup();
-    virtual void didSend(SCIONPacket *packet);
-    int sendRawPacket(uint8_t *buf, int len, HostAddr *firstHop);
-
-protected:
-    int checkPath(uint8_t *ptr, int len, std::vector<Path *> &candidates);
-    void prunePaths();
-    void insertPaths(std::vector<Path *> &candidates);
-    int insertOnePath(Path *p);
-
-    int                          mDaemonSocket;
-    int                          mSendSocket;
-    SCIONAddr                    mLocalAddr;
-    SCIONAddr                    mDstAddr;
-
-    std::vector<Path *>          mPaths;
-    pthread_mutex_t              mPathMutex;
-    pthread_cond_t               mPathCond;
-    pthread_mutex_t              mDispatcherMutex;
-    int                          mInvalid;
-    PathPolicy                   mPolicy;
-};
-
 // SSP
 
 class SSPConnectionManager : public PathManager {

@@ -19,6 +19,21 @@ public:
     SCIONProtocol(int sock, const char *sciond);
     virtual ~SCIONProtocol();
 
+    void getDefaultIP();
+    int getPathCount();
+    int maxPayloadSize(double timeout=0.0);
+    void queryLocalAddress();
+    virtual int setRemoteAddress(SCIONAddr addr, double timeout=0.0);
+    void getPaths(double timeout=0.0);
+    void prunePaths();
+    int checkPath(uint8_t *ptr, int len, std::vector<Path *> &candidates);
+    void insertPaths(std::vector<Path *> &candidates);
+    int insertOnePath(Path *p);
+    virtual Path * createPath(SCIONAddr &dstAddr, uint8_t *rawPath, int pathLen);
+    int setISDWhitelist(void *data, size_t len);
+    int sendRawPacket(uint8_t *buf, int len, HostAddr *firstHop);
+    virtual void didSend(SCIONPacket *packet);
+
     virtual int bind(SCIONAddr addr, int sock);
     virtual int connect(SCIONAddr addr, double timeout=0.0);
     virtual int listen(int sock);
@@ -56,13 +71,13 @@ public:
     virtual void threadCleanup();
 
     int getPort();
-    int maxPayloadSize(double timeout=0.0);
 
 protected:
     PathManager            *mPathManager;
 
     int                    mSocket;
     uint16_t               mSrcPort;
+    SCIONAddr                    mLocalAddr;
     SCIONAddr              mDstAddr;
     uint16_t               mDstPort;
     int                    mProtocolID;
@@ -78,6 +93,14 @@ protected:
     uint32_t               mProbeInterval;
     uint32_t               mProbeNum;
     struct timeval         mLastProbeTime;
+
+    int                          mDaemonSocket;
+    std::vector<Path *>          mPaths;
+    pthread_mutex_t              mPathMutex;
+    pthread_cond_t               mPathCond;
+    pthread_mutex_t              mDispatcherMutex;
+    int                          mInvalid;
+    PathPolicy                   mPolicy;
 
     pthread_t              mTimerThread;
     pthread_mutex_t        mStateMutex;
