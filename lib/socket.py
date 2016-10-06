@@ -25,9 +25,11 @@ from errno import EHOSTUNREACH, ENETUNREACH
 from socket import (
     AF_INET,
     AF_INET6,
+    AF_NETLINK,
     AF_UNIX,
     MSG_DONTWAIT,
     SOCK_DGRAM,
+    SOCK_RAW,
     SOCK_STREAM,
     SOL_SOCKET,
     SO_REUSEADDR,
@@ -84,6 +86,30 @@ class Socket(object):
         prev = self.sock.gettimeout()
         self.sock.settimeout(timeout)
         return prev
+
+
+class NetlinkSocket(Socket):
+    NETLINK_SCION = 22
+    MAX_DATA_LEN = 2048
+
+    def __init__(self, proto, group):
+        self.sock = socket(AF_NETLINK, SOCK_RAW, proto)
+        self.bind((os.getpid(), group))
+
+    def bind(self, addr):
+        self.sock.bind(addr)
+
+    def send(self, data, dst=None):
+        header = struct.pack("=LHHLL", 16 + len(data), 0, 0, 0, os.getpid())
+        data = header + data
+        self.sock.send(data)
+
+    def recv(self, block=True):
+        data = self.sock.recv(self.MAX_DATA_LEN)
+        logging.info("recvd %d bytes of data on netlink socket: %s", len(data), data)
+        hdr_len, hdr_type, hdr_flags, hdr_seq, hdr_pid = struct.unpack(
+            "=LHHLL", data[:16])
+        return data[16:], None
 
 
 class UDPSocket(Socket):

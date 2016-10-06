@@ -41,7 +41,7 @@ from lib.packet.scmp.types import SCMPClass, SCMPPathClass
 from lib.path_db import DBResult, PathSegmentDB
 from lib.requests import RequestHandler
 from lib.sibra.ext.resv import ResvBlockSteady
-from lib.socket import ReliableSocket
+from lib.socket import NetlinkSocket, ReliableSocket
 from lib.thread import thread_safety_net
 from lib.types import (
     PathMgmtType as PMT,
@@ -102,6 +102,8 @@ class SCIONDaemon(SCIONElement):
         if run_local_api:
             self._api_sock = ReliableSocket(bind=(self.api_addr, "sciond"))
             self._socks.add(self._api_sock, self.handle_accept)
+            self._nl_sock = NetlinkSocket(22, 1)
+            self._socks.add(self._nl_sock, self.handle_recv)
 
     @classmethod
     def start(cls, conf_dir, addr, api_addr=None, run_local_api=False, port=0):
